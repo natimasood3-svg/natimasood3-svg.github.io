@@ -243,10 +243,11 @@ function pinIcon(label, cls){
 function renderMap(){
   markerLayer.clearLayers();
   const nextId = nextStop()?.id;
-  if(S.start && S.start.lat!=null){
-    L.marker([S.start.lat,S.start.lng],{icon:pinIcon("H","home"), zIndexOffset:-100}).addTo(markerLayer).on("click",openSettings);
+  const sp=startPt();
+  if(sp && sp.lat!=null){
+    L.marker([sp.lat,sp.lng],{icon:pinIcon("H","home"), zIndexOffset:-100}).addTo(markerLayer).on("click",openSettings);
   }
-  if(endPoint() && S.settings.endMode==="address"){
+  if(endPoint() && endPoint().address!==sp?.address && (S.dayEnd || S.settings.endMode==="address")){
     const e=endPoint(); L.marker([e.lat,e.lng],{icon:pinIcon("E","home")}).addTo(markerLayer).on("click",openSettings);
   }
   S.stops.forEach((s,i)=>{
@@ -264,13 +265,13 @@ function renderMap(){
   }
 }
 function linePoints(){
-  const pts=[]; if(S.start && S.start.lat!=null) pts.push([S.start.lat,S.start.lng]);
+  const pts=[]; const sp=startPt(); if(sp && sp.lat!=null) pts.push([sp.lat,sp.lng]);
   S.stops.forEach(s=>{ if(s.lat!=null && s.status==="pending") pts.push([s.lat,s.lng]); });
   const e=endPoint(); if(e) pts.push([e.lat,e.lng]);
   return pts;
 }
 function fitAll(){
-  const pts=[]; if(S.start&&S.start.lat!=null) pts.push([S.start.lat,S.start.lng]);
+  const pts=[]; const sp=startPt(); if(sp&&sp.lat!=null) pts.push([sp.lat,sp.lng]);
   S.stops.forEach(s=>{ if(s.lat!=null) pts.push([s.lat,s.lng]); });
   if(pts.length===1) map.setView(pts[0],15);
   else if(pts.length) map.fitBounds(pts,{padding:[30,30]});
@@ -279,7 +280,7 @@ function cssVar(n){ return getComputedStyle(document.documentElement).getPropert
 map.on("click", e=>{
   if(!pickFor) return;
   const target = pickFor; pickFor=null; $("#pickBanner").hidden=true;
-  if(target==="start"){ S.start = {...(S.start||{}), address:(S.start&&S.start.address)||"נקודה במפה", lat:e.latlng.lat, lng:e.latlng.lng}; }
+  if(target==="start"){ S.dayStart=null; S.start = {...(S.start||{}), address:(S.start&&S.start.address)||"נקודה במפה", lat:e.latlng.lat, lng:e.latlng.lng}; }
   else { const s=S.stops.find(x=>x.id===target); if(s){ s.lat=e.latlng.lat; s.lng=e.latlng.lng; s.geo="ok"; } }
   invalidateRoute(); save(); render(); toast("המיקום עודכן");
 });
@@ -300,8 +301,11 @@ function getPosition(){
 }
 
 /* ---------- helpers ---------- */
+function startPt(){ return (S.dayStart && S.dayStart.lat!=null) ? S.dayStart : S.start; }
 function endPoint(){
-  if(S.settings.endMode==="return" && S.start && S.start.lat!=null) return S.start;
+  if(S.dayEnd && S.dayEnd.lat!=null) return S.dayEnd;
+  const sp=startPt();
+  if(S.settings.endMode==="return" && sp && sp.lat!=null) return sp;
   if(S.settings.endMode==="address" && S.end && S.end.lat!=null) return S.end;
   return null;
 }
@@ -434,14 +438,14 @@ let optBusy=false;
 async function optimize(){
   if(optBusy) return;
   if(geoBusy){ toast("המתן שאיתור הכתובות יסתיים"); return; }
-  if(!S.start || S.start.lat==null){
+  if(!startPt() || startPt().lat==null){
     toast("קודם קבע נקודת התחלה", "הגדר", 5000, openSettings); return;
   }
   const pend = S.stops.filter(s=>s.status==="pending" && s.lat!=null);
   if(pend.length<2){ toast("צריך לפחות 2 עצירות עם מיקום כדי לסדר מסלול"); return; }
   optBusy=true; render();
   const e = endPoint();
-  const pts=[S.start, ...pend, ...(e?[e]:[])];
+  const pts=[startPt(), ...pend, ...(e?[e]:[])];
   let mx;
   try{ mx = await osrmMatrix(pts); }catch(err){ mx = airMatrix(pts); }
   const {order} = solveRoute(mx.dur, pts.length, !!e);
@@ -522,26 +526,45 @@ function cellIsToday(v,d=new Date()){
   return +n[0]===d.getDate() && +n[1]===d.getMonth()+1;
 }
 let sheetBusy=false, sheetLastFetch=0;
+async function resolvePoint(txt){
+  if(!txt) return null;
+  const address=parseLines(txt)[0]?.address||txt;
+  try{ const g=await geocode(address); if(!g) { toast(`לא הצלחתי לאתר את "${address}" מהגיליון`,null,5000); return null; }
+    if(!g.cached) await sleep(1100);
+    return {address:txt, lat:g.lat, lng:g.lng};
+  }catch(e){ return null; }
+}
+async function applyDayPoints(startTxt,endTxt){
+  S.dayStart=await resolvePoint(startTxt);
+  S.dayEnd = (endTxt && endTxt===startTxt) ? S.dayStart : await resolvePoint(endTxt);
+}
 async function loadFromSheet(opts={}){
   const id=S.settings.sheetId; if(!id||sheetBusy) return;
   sheetBusy=true; sheetLastFetch=Date.now();
   try{
-    const head=(await sheetRange(id,"A5:F5"))[0]||[];
+    const grid=await sheetRange(id,"A5:G108");
+    const head=grid[0]||[];
     let col=head.findIndex(v=>cellIsToday(v));
     if(col<0){ if(!opts.quiet) toast(new Date().getDay()===6?"אין תכנון לשבת בגיליון":"בגיליון אין עמודה לתאריך של היום. בדוק את תאריך תחילת השבוע."); return; }
-    const body=await sheetRange(id,"A8:F107");
-    const lines=body.map(r=>String(r[col]||"").trim()).filter(Boolean).join("\n");
+    const cell=r=>String(((grid[r]||[])[col])||"").trim();
+    const startTxt=cell(2), endTxt=cell(3);
+    const lines=grid.slice(4).map(r=>String(r[col]||"").trim()).filter(Boolean).join("\n");
     const list=parseLines(lines);
     const tk=todayKey();
     if(S.day!==tk){
       const keep={settings:S.settings,start:S.start,end:S.end};
       S=blank(keep.settings); S.start=keep.start; S.end=keep.end; S.day=tk;
+      await applyDayPoints(startTxt,endTxt);
       if(!list.length){ save(); render(); if(!opts.quiet) toast("אין עצירות להיום בגיליון"); return; }
       toast(`נטענו ${list.length} עצירות מהגיליון. מאתר ומסדר…`,null,4000);
       await addStops(list);
-      if(S.start && S.start.lat!=null) await optimize();
+      if(startPt() && startPt().lat!=null) await optimize();
       else toast("כדי לסדר את המסלול, קבע נקודת התחלה","הגדר",6000,openSettings);
     } else {
+      if(startTxt!==(S.dayStart?.address||"") || endTxt!==(S.dayEnd?.address||"")){
+        await applyDayPoints(startTxt,endTxt); invalidateRoute(); save(); render();
+        if(!opts.quiet) toast("נקודות ההתחלה והסיום עודכנו מהגיליון. לחץ \"סדר מסלול\".",null,5000);
+      }
       const have=new Set(S.stops.map(s=>s.address.trim()));
       const fresh=list.filter(r=>!have.has(r.address.trim()));
       if(fresh.length){ toast(`נוספו ${fresh.length} עצירות חדשות מהגיליון. לחץ "סדר מסלול" כדי לשבץ אותן.`,null,6000); await addStops(fresh); }
@@ -573,7 +596,7 @@ function renderPlan(c){
     h+=`<div class="empty"><h3>אין עדיין עצירות</h3><p>הדבק רשימת כתובות או ייבא קובץ אקסל, ואז סדר את המסלול.</p></div>`;
   } else {
     h+=`<ul class="list">`;
-    h+=`<li><button class="row home homerow" data-act="settings"><span class="num">H</span><span class="txt"><div class="addr">${S.start?esc(S.start.address):"קבע נקודת התחלה"}</div><div class="sub">${S.start?"נקודת התחלה":"<span class=warn>חסרה נקודת התחלה</span>"}</div></span><span class="chev">${ICON.chev}</span></button></li>`;
+    h+=`<li><button class="row home homerow" data-act="settings"><span class="num">H</span><span class="txt"><div class="addr">${startPt()?esc(startPt().address):"קבע נקודת התחלה"}</div><div class="sub">${startPt()?(S.dayStart?"נקודת התחלה (מהגיליון)":"נקודת התחלה"):"<span class=warn>חסרה נקודת התחלה</span>"}</div></span><span class="chev">${ICON.chev}</span></button></li>`;
     S.stops.forEach((s,i)=>{
       const sub = s.geo==="fail" ? `<span class="warn">כתובת לא אותרה</span>` : s.geo==="pending" ? "מאתר…" :
         s.status==="done" ? `נמסר ${timeStr(s.doneAt)}` : s.status==="failed" ? `לא נמסר${s.reason?" · "+esc(s.reason):""}` :
@@ -581,7 +604,8 @@ function renderPlan(c){
       h+=`<li><button class="row ${s.status}" data-stop="${s.id}"><span class="num">${i+1}</span><span class="txt"><div class="addr">${esc(s.address)}</div><div class="sub">${sub||"&nbsp;"}</div></span><span class="chev">${ICON.chev}</span></button></li>`;
     });
     const e=S.settings.endMode;
-    if(e!=="last") h+=`<li><button class="row home homerow" data-act="settings"><span class="num">${e==="return"?"H":"E"}</span><span class="txt"><div class="addr">${e==="return"?"חזרה לנקודת ההתחלה":esc(S.end?.address||"קבע נקודת סיום")}</div><div class="sub">סיום</div></span><span class="chev">${ICON.chev}</span></button></li>`;
+    if(S.dayEnd) h+=`<li><button class="row home homerow" data-act="settings"><span class="num">${S.dayEnd.address===S.dayStart?.address?"H":"E"}</span><span class="txt"><div class="addr">${esc(S.dayEnd.address)}</div><div class="sub">סיום (מהגיליון)</div></span><span class="chev">${ICON.chev}</span></button></li>`;
+    else if(e!=="last") h+=`<li><button class="row home homerow" data-act="settings"><span class="num">${e==="return"?"H":"E"}</span><span class="txt"><div class="addr">${e==="return"?"חזרה לנקודת ההתחלה":esc(S.end?.address||"קבע נקודת סיום")}</div><div class="sub">סיום</div></span><span class="chev">${ICON.chev}</span></button></li>`;
     h+=`</ul>`;
     if(c.done||c.failed) h+=`<div style="padding-top:14px"><button class="btn ghost" style="width:100%" data-act="report">${ICON.report} ייצוא דוח מסירות (CSV)</button></div>`;
   }
@@ -784,14 +808,14 @@ function openSettings(){
       const sheetChanged=newSheet!==(st.sheetId||""); st.sheetId=newSheet; if(sheetChanged) S.day=null;
       const sv=sh.querySelector("#sStart").value.trim(), ev=sh.querySelector("#sEnd").value.trim();
       closeSheet();
-      if(gps){ S.start={address:"מיקום נוכחי",lat:gps.lat,lng:gps.lng}; invalidateRoute(); }
+      if(gps){ S.start={address:"מיקום נוכחי",lat:gps.lat,lng:gps.lng}; S.dayStart=null; invalidateRoute(); }
       else if(sv && sv!==S.start?.address){
         toast("מאתר נקודת התחלה…");
-        try{ const g=await geocode(sv); if(g){ S.start={address:sv,...g}; invalidateRoute(); } else toast("נקודת ההתחלה לא אותרה. נסה לסמן במפה."); }catch(e){ toast("אין חיבור לשרת המפות"); }
+        try{ const g=await geocode(sv); if(g){ S.start={address:sv,lat:g.lat,lng:g.lng}; S.dayStart=null; invalidateRoute(); } else toast("נקודת ההתחלה לא אותרה. נסה לסמן במפה."); }catch(e){ toast("אין חיבור לשרת המפות"); }
       }
       if(st.endMode==="address" && ev && ev!==S.end?.address){
         await sleep(1100);
-        try{ const g=await geocode(ev); if(g){ S.end={address:ev,...g}; } else toast("כתובת הסיום לא אותרה"); }catch(e){}
+        try{ const g=await geocode(ev); if(g){ S.end={address:ev,lat:g.lat,lng:g.lng}; S.dayEnd=null; } else toast("כתובת הסיום לא אותרה"); }catch(e){}
       }
       invalidateRoute(); save(); render(); fitAll();
       if(st.sheetId && (sheetChanged || (S.day!==todayKey()))) loadFromSheet();
