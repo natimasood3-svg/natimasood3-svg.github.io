@@ -328,8 +328,17 @@ function navUrl(s){
 }
 function timeStr(ts){ const d=new Date(ts); return d.toLocaleTimeString("he-IL",{hour:"2-digit",minute:"2-digit"}); }
 
-/* ---------- geocoding (OpenStreetMap Nominatim, max 1 req/sec) ---------- */
+/* ---------- geocoding (OpenStreetMap Nominatim, max 1 req/sec) + local cache ---------- */
+const GEO_KEY="maslulan.geo";
+let geoCache={}; try{ geoCache=JSON.parse(localStorage.getItem(GEO_KEY)||"{}"); }catch(e){}
+function geoKey(q){ return (S.settings.country||"*")+"|"+q.trim().replace(/\s+/g," "); }
 async function geocode(q){
+  const k=geoKey(q); if(geoCache[k]) return {...geoCache[k], cached:true};
+  const g=await geocodeNet(q);
+  if(g){ geoCache[k]=g; try{ localStorage.setItem(GEO_KEY, JSON.stringify(geoCache)); }catch(e){} }
+  return g;
+}
+async function geocodeNet(q){
   const cc = S.settings.country ? `&countrycodes=${S.settings.country}` : "";
   const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&accept-language=he${cc}&q=${encodeURIComponent(q)}`;
   const r = await fetch(url,{headers:{"Accept":"application/json"}});
@@ -337,19 +346,24 @@ async function geocode(q){
   const j = await r.json();
   return j[0] ? {lat:+j[0].lat, lng:+j[0].lon} : null;
 }
-let geoBusy=false, geoProgress=null;
-async function runGeocode(){
-  if(geoBusy) return; geoBusy=true;
+let geoBusy=false, geoProgress=null, geoPromise=null;
+function runGeocode(){
+  if(geoBusy) return geoPromise;
+  geoPromise=runGeocodeInner(); return geoPromise;
+}
+async function runGeocodeInner(){
+  geoBusy=true;
   const todo = S.stops.filter(s=>s.geo==="pending");
   geoProgress={done:0,total:todo.length}; render();
   for(const s of todo){
     if(!S.stops.includes(s)) continue;
+    let cached=false;
     try{
       const g = await geocode(s.address);
-      if(g){ s.lat=g.lat; s.lng=g.lng; s.geo="ok"; } else { s.geo="fail"; s.lat=null; s.lng=null; }
+      if(g){ s.lat=g.lat; s.lng=g.lng; s.geo="ok"; cached=!!g.cached; } else { s.geo="fail"; s.lat=null; s.lng=null; }
     }catch(e){ s.geo="fail"; s.netErr=true; }
     geoProgress.done++; save(); render();
-    await sleep(1100);
+    if(!cached) await sleep(1100);
   }
   geoBusy=false; geoProgress=null; render(); fitAll();
   const f=S.stops.filter(s=>s.geo==="fail").length;
@@ -482,7 +496,60 @@ function rowsFromTable(rows){
 function addStops(list){
   if(S.sample){ const keep=S.settings; S=blank(keep); }
   list.forEach(r=>S.stops.push({id:uid(), ...r, lat:null, lng:null, geo:"pending", status:"pending"}));
-  invalidateRoute(); save(); render(); runGeocode();
+  invalidateRoute(); save(); render(); return runGeocode();
+}
+
+/* ---------- weekly Google Sheet ---------- */
+function sheetIdFrom(v){ v=String(v||"").trim(); const m=v.match(/\/d\/([\w-]{20,})/); return m?m[1]:(/^[\w-]{20,}$/.test(v)?v:""); }
+function parseCSV(t){
+  const rows=[]; let row=[], f="", q=false;
+  for(let i=0;i<t.length;i++){ const c=t[i];
+    if(q){ if(c==='"'){ if(t[i+1]==='"'){ f+='"'; i++; } else q=false; } else f+=c; }
+    else if(c==='"') q=true; else if(c===','){ row.push(f); f=""; }
+    else if(c==='\n'){ row.push(f); rows.push(row); row=[]; f=""; } else if(c!=='\r') f+=c; }
+  if(f!==""||row.length){ row.push(f); rows.push(row); }
+  return rows;
+}
+async function sheetRange(id, range){
+  const r=await fetch(`https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&gid=0&headers=0&range=${range}&t=${Date.now()}`,{cache:"no-store"});
+  if(!r.ok) throw new Error("sheet "+r.status);
+  const txt=await r.text(); if(/^\s*</.test(txt)) throw new Error("not shared");
+  return parseCSV(txt);
+}
+function todayKey(d=new Date()){ return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; }
+function cellIsToday(v,d=new Date()){
+  const n=String(v||"").match(/\d+/g); if(!n||n.length<2) return false;
+  return +n[0]===d.getDate() && +n[1]===d.getMonth()+1;
+}
+let sheetBusy=false, sheetLastFetch=0;
+async function loadFromSheet(opts={}){
+  const id=S.settings.sheetId; if(!id||sheetBusy) return;
+  sheetBusy=true; sheetLastFetch=Date.now();
+  try{
+    const head=(await sheetRange(id,"A5:F5"))[0]||[];
+    let col=head.findIndex(v=>cellIsToday(v));
+    if(col<0){ if(!opts.quiet) toast(new Date().getDay()===6?"אין תכנון לשבת בגיליון":"בגיליון אין עמודה לתאריך של היום. בדוק את תאריך תחילת השבוע."); return; }
+    const body=await sheetRange(id,"A8:F107");
+    const lines=body.map(r=>String(r[col]||"").trim()).filter(Boolean).join("\n");
+    const list=parseLines(lines);
+    const tk=todayKey();
+    if(S.day!==tk){
+      const keep={settings:S.settings,start:S.start,end:S.end};
+      S=blank(keep.settings); S.start=keep.start; S.end=keep.end; S.day=tk;
+      if(!list.length){ save(); render(); if(!opts.quiet) toast("אין עצירות להיום בגיליון"); return; }
+      toast(`נטענו ${list.length} עצירות מהגיליון. מאתר ומסדר…`,null,4000);
+      await addStops(list);
+      if(S.start && S.start.lat!=null) await optimize();
+      else toast("כדי לסדר את המסלול, קבע נקודת התחלה","הגדר",6000,openSettings);
+    } else {
+      const have=new Set(S.stops.map(s=>s.address.trim()));
+      const fresh=list.filter(r=>!have.has(r.address.trim()));
+      if(fresh.length){ toast(`נוספו ${fresh.length} עצירות חדשות מהגיליון. לחץ "סדר מסלול" כדי לשבץ אותן.`,null,6000); await addStops(fresh); }
+      else if(!opts.quiet) toast("המסלול מעודכן מול הגיליון");
+    }
+  }catch(e){
+    if(!opts.quiet) toast("לא הצלחתי לקרוא את הגיליון. ודא שהשיתוף שלו הוא 'כל מי שיש לו את הקישור'.",null,6000);
+  }finally{ sheetBusy=false; render(); }
 }
 
 /* ---------- render ---------- */
@@ -496,6 +563,7 @@ function render(){
 function renderPlan(c){
   let h=`<div class="inner">`;
   h+=`<div class="routehead"><h2>${S.sample?"מסלול לדוגמה":"המסלול של היום"}</h2><small>${c.total} עצירות</small></div>`;
+  if(S.settings.sheetId) h+=`<div class="banner"><span>${sheetBusy?"טוען מהגיליון…":"מחובר לגיליון התכנון השבועי"}</span><button data-act="sheet" ${sheetBusy?"disabled":""}>רענן מהגיליון</button></div>`;
   if(S.sample) h+=`<div class="banner"><span>אלה כתובות לדוגמה בתל אביב, כדי שתראה איך זה עובד.</span><button data-act="clear-sample">נקה והתחל מסלול משלי</button></div>`;
   if(geoProgress){ const pct=geoProgress.total?Math.round(geoProgress.done/geoProgress.total*100):0;
     h+=`<div class="summary"><span>מאתר כתובות <b>${geoProgress.done}/${geoProgress.total}</b></span></div><div class="progress"><i style="width:${pct}%"></i></div>`; }
@@ -572,6 +640,7 @@ document.addEventListener("click", e=>{
   else if(a==="fit") fitAll();
   else if(a==="settings") openSettings();
   else if(a==="report") exportReport();
+  else if(a==="sheet") loadFromSheet();
   else if(a==="clear-sample"){ S=blank(S.settings); save(); render(); openAdd(); }
 });
 $("#btnSettings").onclick=openSettings;
@@ -695,6 +764,7 @@ function openSettings(){
       <label><input type="radio" name="nav" value="waze" ${st.navApp==="waze"?"checked":""}><span>Waze</span></label>
       <label><input type="radio" name="nav" value="google" ${st.navApp==="google"?"checked":""}><span>Google Maps</span></label>
       <label><input type="radio" name="nav" value="apple" ${st.navApp==="apple"?"checked":""}><span>Apple Maps</span></label></div></div>
+    <div class="field"><label for="sSheet">קישור לגיליון התכנון השבועי</label><input id="sSheet" dir="ltr" value="${esc(st.sheetId?`https://docs.google.com/spreadsheets/d/${st.sheetId}/edit`:"")}" placeholder="הדבק כאן קישור ל-Google Sheets"><div class="hint">כשמחובר, האפליקציה טוענת לבד את העמודה של היום בכל פעם שפותחים אותה.</div></div>
     <div class="field"><label for="sCountry">חיפוש כתובות</label><select id="sCountry"><option value="il" ${st.country==="il"?"selected":""}>בישראל בלבד</option><option value="" ${!st.country?"selected":""}>בכל העולם</option></select></div>
     <button class="btn primary" id="sSave">שמור</button>
     <div class="divider"></div>
@@ -710,6 +780,8 @@ function openSettings(){
       st.navApp=sh.querySelector("[name=nav]:checked").value;
       st.endMode=sh.querySelector("[name=endm]:checked").value;
       st.country=sh.querySelector("#sCountry").value;
+      const newSheet=sheetIdFrom(sh.querySelector("#sSheet").value);
+      const sheetChanged=newSheet!==(st.sheetId||""); st.sheetId=newSheet; if(sheetChanged) S.day=null;
       const sv=sh.querySelector("#sStart").value.trim(), ev=sh.querySelector("#sEnd").value.trim();
       closeSheet();
       if(gps){ S.start={address:"מיקום נוכחי",lat:gps.lat,lng:gps.lng}; invalidateRoute(); }
@@ -722,6 +794,7 @@ function openSettings(){
         try{ const g=await geocode(ev); if(g){ S.end={address:ev,...g}; } else toast("כתובת הסיום לא אותרה"); }catch(e){}
       }
       invalidateRoute(); save(); render(); fitAll();
+      if(st.sheetId && (sheetChanged || (S.day!==todayKey()))) loadFromSheet();
     };
     const rt=sh.querySelector("#sRetry"); if(rt) rt.onclick=()=>{ S.stops.forEach(s=>{ if(s.geo==="fail") s.geo="pending"; }); closeSheet(); runGeocode(); };
     const nw=sh.querySelector("#sNew");
@@ -752,7 +825,16 @@ function toast(msg, action, ms=3000, fn){
 }
 
 /* ---------- boot ---------- */
+(function linkFromHash(){
+  const m=location.hash.match(/sheet=([\w-]{20,})/);
+  if(m){ S.settings.sheetId=m[1]; S.day=null; save(); try{ history.replaceState(null,"",location.pathname); }catch(e){} }
+})();
+document.addEventListener("visibilitychange",()=>{
+  if(document.visibilityState==="visible" && S.settings.sheetId && Date.now()-sheetLastFetch>3*60*1000)
+    loadFromSheet({quiet:S.day===todayKey()});
+});
 render(); fitAll();
+if(S.settings.sheetId) loadFromSheet({quiet:S.day===todayKey()});
 if(S.stops.some(s=>s.geo==="pending")) runGeocode();
 if(S.stats && !S.routeGeo && !S.sample) fetchRouteGeometry().then(render);
 })();
